@@ -1,7 +1,7 @@
 #include "smoothDeformer.h"
 
+// Note: Ensure this ID is requested from Autodesk for production use to avoid conflicts.
 MTypeId SmoothDeformer::id(0x000494f2);
-
 
 MObject SmoothDeformer::aStrength;
 MObject SmoothDeformer::aSmoothBorders;
@@ -10,141 +10,127 @@ MObject SmoothDeformer::aSmoothType;
 MObject SmoothDeformer::aLambda;
 MObject SmoothDeformer::aMu;
 
-
 SmoothDeformer::SmoothDeformer() {
     CHECK_MSTATUS(MThreadPool::init());
 }
-
 
 SmoothDeformer::~SmoothDeformer() {
     MThreadPool::release();
 }
 
-
 void* SmoothDeformer::creator() {
     return new SmoothDeformer();
 }
 
-
-MStatus SmoothDeformer::getInputMesh(MDataBlock& dataBlock, unsigned int geomIndex, MObject &oInputGeom) {
-    // Gets the input mesh that will be deformed.
-
+MStatus SmoothDeformer::getInputMesh(MDataBlock& dataBlock, unsigned int geomIndex, MObject& oInputGeom) {
     MStatus status;
-    //using output to prevent Maya from triggering a dirty propagation
+    
+    // Using output array to prevent Maya from triggering unnecessary dirty propagation
     MArrayDataHandle hInput = dataBlock.outputArrayValue(input, &status);
     CHECK_MSTATUS(status);
+    
     status = hInput.jumpToElement(geomIndex);
-    oInputGeom = hInput.outputValue().child(inputGeom).asMesh();
+    if (status) {
+        oInputGeom = hInput.outputValue().child(inputGeom).asMesh();
+    }
+    
     return status;
 }
 
-
-
-float* SmoothDeformer::getWeightList(MDataBlock& dataBlock, unsigned int geomIndex, unsigned int numVertex){
-    // Returns a list with the weight of all the vertex in the geo whose index is geomIndex.
-
-    float* paintWeights = new float[numVertex];
-    for (unsigned int index=0; index<numVertex; ++index) {
-        //Current point and weight
+std::vector<float> SmoothDeformer::getWeightList(MDataBlock& dataBlock, unsigned int geomIndex, unsigned int numVertex) {
+    std::vector<float> paintWeights(numVertex, 1.0f);
+    for (unsigned int index = 0; index < numVertex; ++index) {
         paintWeights[index] = weightValue(dataBlock, geomIndex, index);
     }
     return paintWeights;
 }
 
-
-
-MStatus SmoothDeformer::deform(MDataBlock& dataBlock, MItGeometry& itGeo, const MMatrix& localToWorldMatrix, unsigned int geomIndex){
-    // Computes the deformation.
-
+MStatus SmoothDeformer::deform(MDataBlock& dataBlock, MItGeometry& itGeo, const MMatrix& localToWorldMatrix, unsigned int geomIndex) {
     MStatus status;
 
-    //Get the input envelope
     float envelopeValue = dataBlock.inputValue(envelope, &status).asFloat();
     CHECK_MSTATUS(status);
-    if (!envelopeValue) {
-        return MS::kSuccess;
+    if (envelopeValue <= 0.0f) {
+        return MS::kSuccess; // Early exit if envelope is 0
     }
 
-    //Get the input steps
     int iterations = dataBlock.inputValue(aStrength, &status).asInt();
     CHECK_MSTATUS(status);
-    if (!iterations) {
+    if (iterations <= 0) {
         return MS::kSuccess;
     }
 
-    //Get the input maintain
     float maintainValue = dataBlock.inputValue(aMaintain, &status).asFloat();
     CHECK_MSTATUS(status);
 
-    //Get the input smooth borders
-    short smoothBorders = dataBlock.inputValue(aSmoothBorders, &status).asShort();
+    bool smoothBorders = dataBlock.inputValue(aSmoothBorders, &status).asBool();
     CHECK_MSTATUS(status);
 
-    //Get the input smooth type
     short smoothType = dataBlock.inputValue(aSmoothType, &status).asShort();
     CHECK_MSTATUS(status);
 
-    //Get the input lambda
     float lambdaInput = dataBlock.inputValue(aLambda, &status).asFloat();
     CHECK_MSTATUS(status);
 
-    //Get the input mu
     float mu = dataBlock.inputValue(aMu, &status).asFloat();
     CHECK_MSTATUS(status);
 
     MObject inputGeomObj;
-    getInputMesh(dataBlock, geomIndex, inputGeomObj);
-
-    float* paintWeights = getWeightList(dataBlock, geomIndex, itGeo.count());
+    status = getInputMesh(dataBlock, geomIndex, inputGeomObj);
+    CHECK_MSTATUS(status);
 
     TaskData taskData;
     itGeo.allPositions(taskData.points);
-    itGeo.allPositions(taskData.newPoints);
+    itGeo.allPositions(taskData.newPoints); // Initialize newPoints to original positions
+    
     taskData.envelope = envelopeValue;
     taskData.inputGeom = inputGeomObj;
     taskData.iterations = iterations;
     taskData.maintainValue = maintainValue;
     taskData.smoothBorders = smoothBorders;
     taskData.lambda = lambdaInput;
-    taskData.paintWeights = paintWeights;
+    taskData.paintWeights = getWeightList(dataBlock, geomIndex, itGeo.count());
 
-    //Get the normals from each vertex
+    // Cache vertex normals
     MFnMesh fnMesh(inputGeomObj, &status);
+    CHECK_MSTATUS(status);
     fnMesh.getVertexNormals(true, taskData.normals, MSpace::kTransform);
 
-
-    for (int type = 0; type < smoothType+1; type++){
-        for (int itGeo = 0; itGeo < iterations; itGeo++) {
-            unsigned int numTasks = MThreadUtils::getNumThreads;
+    // Evaluation loop (Type 0 = Laplacian, Type 1 = Taubin)
+    for (int type = 0; type <= smoothType; type++) {
+        for (int iter = 0; iter < iterations; iter++) {
+            unsigned int numTasks = MThreadUtils::getNumThreads();
             ThreadData* pThreadData = createThreadData(numTasks, &taskData);
+            
             MThreadPool::newParallelRegion(createTasks, (void*)pThreadData);
-            taskData.points = taskData.newPoints;
-            delete [] pThreadData;
+            
+            // Swap buffers for the next iteration
+            taskData.points = taskData.newPoints; 
+            delete[] pThreadData;
         }
-        taskData.lambda = -1 * lambdaInput + mu;
+        // If Taubin, flip lambda and add mu for the shrinking correction pass
+        taskData.lambda = (-1.0f * lambdaInput) + mu;
     }
-    //Set new positions:
+
+    // Set final positions
     itGeo.setAllPositions(taskData.points);
 
     return MS::kSuccess;
 }
 
-
-
-ThreadData* SmoothDeformer::createThreadData(unsigned int numTasks, TaskData* pTaskData){
-    //Creates the thread data
-
+ThreadData* SmoothDeformer::createThreadData(unsigned int numTasks, TaskData* pTaskData) {
     ThreadData* pThreadData = new ThreadData[numTasks];
     unsigned int numPoints = pTaskData->points.length();
-    unsigned int taskLength = (numPoints+numTasks-1)/numTasks;
+    unsigned int taskLength = (numPoints + numTasks - 1) / numTasks;
+    
     unsigned int start = 0;
     unsigned int end = taskLength;
 
-    int lastTask = numTasks-1;
-    for(unsigned int i=0; i<numTasks; i++){
-        if(i==lastTask){
-            end = numPoints;
+    for (unsigned int i = 0; i < numTasks; i++) {
+        if (i == numTasks - 1) {
+            end = numPoints; // Ensure the last task grabs any remainder
         }
+        
         pThreadData[i].start = start;
         pThreadData[i].end = end;
         pThreadData[i].numTasks = numTasks;
@@ -153,29 +139,22 @@ ThreadData* SmoothDeformer::createThreadData(unsigned int numTasks, TaskData* pT
         start += taskLength;
         end += taskLength;
     }
+    
     return pThreadData;
 }
 
-
-
-void SmoothDeformer::createTasks(void* pData, MThreadRootTask* pRoot){
-    //Creates the thread tasks
-
+void SmoothDeformer::createTasks(void* pData, MThreadRootTask* pRoot) {
     ThreadData* pThreadData = (ThreadData*)pData;
-    if(pThreadData){
+    if (pThreadData) {
         int numTasks = pThreadData->numTasks;
-        for(int i=0; i<numTasks; ++i){
+        for (int i = 0; i < numTasks; ++i) {
             MThreadPool::createTask(threadEvaluate, (void*)&pThreadData[i], pRoot);
         }
         MThreadPool::executeAndJoin(pRoot);
     }
 }
 
-
-MThreadRetVal SmoothDeformer::threadEvaluate(void* pParam){
-    //Executes the smooth operation in multiple threads
-
-    MStatus status;
+MThreadRetVal SmoothDeformer::threadEvaluate(void* pParam) {
     ThreadData* pThreadData = (ThreadData*)(pParam);
     TaskData* pTaskData = pThreadData->pTaskData;
 
@@ -184,64 +163,60 @@ MThreadRetVal SmoothDeformer::threadEvaluate(void* pParam){
 
     MPointArray& points = pTaskData->points;
     float envelope = pTaskData->envelope;
-    int iterations = pTaskData->iterations;
     float maintainValue = pTaskData->maintainValue;
-    short smoothBorders = pTaskData->smoothBorders;
+    bool smoothBorders = pTaskData->smoothBorders;
     float lambda = pTaskData->lambda;
 
-    //Get polygon iteration tool
-    MItMeshVertex vertexIt = MItMeshVertex(pTaskData->inputGeom);
+    // Local vertex iterator for this thread's chunk
+    MItMeshVertex vertexIt(pTaskData->inputGeom);
 
-    MPoint averagePoint, offsetPoint, newPoint;
-    for(unsigned int index=start; index<end; ++index){
-        if(index>=points.length()){
-            break;
-        }
-        //Set iterator index
+    for (unsigned int index = start; index < end; ++index) {
+        if (index >= points.length()) break;
+
         int prevPtr = 0;
         vertexIt.setIndex(index, prevPtr);
 
-        //Don't smooth if the vertex is boundary and don't want smooth borders
-        if(vertexIt.onBoundary() && !smoothBorders){
+        // Respect border smoothing rule
+        if (vertexIt.onBoundary() && !smoothBorders) {
             continue;
         }
 
-        //Get connected vertices, vertex neighbors
         MIntArray connectedVertex;
         vertexIt.getConnectedVertices(connectedVertex);
+        
+        unsigned int numConnected = connectedVertex.length();
+        if (numConnected == 0) continue;
 
-        //Get total position
-        MPoint totalPos = MPoint();
-        for (unsigned int conVertex=0; conVertex<connectedVertex.length(); conVertex++) {
-            totalPos = totalPos + points[connectedVertex[conVertex]];
+        // Calculate average position of neighbors
+        MPoint totalPos(0.0, 0.0, 0.0);
+        for (unsigned int i = 0; i < numConnected; i++) {
+            totalPos += points[connectedVertex[i]];
         }
+        
+        MPoint averagePoint = totalPos / static_cast<double>(numConnected);
 
-        //Averaged position
-        averagePoint = totalPos / connectedVertex.length();
-        //Calculate offset
-        offsetPoint = (averagePoint - points[index]) * envelope * pTaskData->paintWeights[index] * lambda;
+        // Offset math correctly utilizing MVector
+        MVector offsetVec = averagePoint - points[index];
+        offsetVec *= (envelope * pTaskData->paintWeights[index] * lambda);
 
-        //Normal distance vector
-        MPoint normalPoint(pTaskData->normals[index]);
-        double amount = sqrt(pow(offsetPoint.x, 2) + pow(offsetPoint.y, 2) + pow(offsetPoint.z, 2));
-        //Calculate new position
-        newPoint = points[index] + offsetPoint + (normalPoint * amount * maintainValue);
+        // Normal volume preservation math
+        MVector normalVec(pTaskData->normals[index]);
+        double amount = offsetVec.length(); 
+        
+        // Final position
+        MPoint newPoint = points[index] + offsetVec + (normalVec * amount * maintainValue);
 
-        //Update new position
         pTaskData->newPoints.set(newPoint, index);
     }
+    
     return 0;
 }
 
-
-
-MStatus SmoothDeformer::initialize(){
-    //Initialize the node, attributes.
-
+MStatus SmoothDeformer::initialize() {
     MFnNumericAttribute nAttr;
     MFnEnumAttribute enumAttr;
 
-    //Smooth type
+    // Smooth Algorithm Type
     aSmoothType = enumAttr.create("smoothAlgorithm", "smoothAlgorithm", 0);
     enumAttr.addField("Laplacian", 0);
     enumAttr.addField("Taubin", 1);
@@ -250,34 +225,32 @@ MStatus SmoothDeformer::initialize(){
     CHECK_MSTATUS(addAttribute(aSmoothType));
     CHECK_MSTATUS(attributeAffects(aSmoothType, outputGeom));
 
-    //Strength
+    // Strength (Iterations)
     aStrength = nAttr.create("strength", "st", MFnNumericData::kInt);
     nAttr.setKeyable(true);
     nAttr.setMin(0.0);
-    nAttr.setMax(300);
+    nAttr.setMax(300.0);
     nAttr.setDefault(0.0);
     CHECK_MSTATUS(addAttribute(aStrength));
     CHECK_MSTATUS(attributeAffects(aStrength, outputGeom));
 
-    //Smooth borders
-    aSmoothBorders = enumAttr.create("smoothBorders", "smb", 0);
-    enumAttr.setKeyable(false);
-    enumAttr.setChannelBox(true);
-    enumAttr.addField("Off", 0);
-    enumAttr.addField("On", 1);
+    // Smooth Borders Flag
+    aSmoothBorders = nAttr.create("smoothBorders", "smb", MFnNumericData::kBoolean, 0);
+    nAttr.setKeyable(false);
+    nAttr.setChannelBox(true);
     CHECK_MSTATUS(addAttribute(aSmoothBorders));
     CHECK_MSTATUS(attributeAffects(aSmoothBorders, outputGeom));
 
-    //Maintain Volume
+    // Maintain Volume Bias
     aMaintain = nAttr.create("maintainVolume", "mtn", MFnNumericData::kFloat);
     nAttr.setKeyable(true);
     nAttr.setMin(0.0);
     nAttr.setMax(1.0);
-    nAttr.setDefault(0);
+    nAttr.setDefault(0.0);
     CHECK_MSTATUS(addAttribute(aMaintain));
     CHECK_MSTATUS(attributeAffects(aMaintain, outputGeom));
 
-    //Lambda
+    // Lambda (Smoothing Factor)
     aLambda = nAttr.create("lambda", "lam", MFnNumericData::kFloat);
     nAttr.setKeyable(true);
     nAttr.setChannelBox(true);
@@ -287,7 +260,7 @@ MStatus SmoothDeformer::initialize(){
     CHECK_MSTATUS(addAttribute(aLambda));
     CHECK_MSTATUS(attributeAffects(aLambda, outputGeom));
 
-    //Mu
+    // Mu (Taubin Shrinkage Correction)
     aMu = nAttr.create("mu", "mu", MFnNumericData::kFloat);
     nAttr.setKeyable(true);
     nAttr.setChannelBox(true);
@@ -297,7 +270,8 @@ MStatus SmoothDeformer::initialize(){
     CHECK_MSTATUS(addAttribute(aMu));
     CHECK_MSTATUS(attributeAffects(aMu, outputGeom));
 
-    //Make weight paintable
+    // Register weight painting for the deformer
     MGlobal::executeCommand("makePaintable -attrType multiFloat -sm deformer smoothDeformer weights;");
+    
     return MS::kSuccess;
 }
